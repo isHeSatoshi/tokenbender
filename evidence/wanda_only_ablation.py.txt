@@ -1,0 +1,181 @@
+"""Non-selecting Wanda-only ablation using the unchanged registered modules."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import resource
+import time
+from pathlib import Path
+
+import torch
+
+from tenpercent.accounting import Budget
+from tenpercent.constants import MODEL_SHA256, PARAMETER_CAP, SEED
+from tenpercent.data import data_commitment, load_split
+from tenpercent.io import append_record, object_hash, read_json, sha256_file, write_json
+from tenpercent.masking import frozen_hash, replace_linears, set_global_mask
+from tenpercent.model import Runner, load_base, load_tokenizer
+from tenpercent.training import require_preregistration, wanda_initialize
+from tenpercent.vocabulary import CompactTokenizer, Vocabulary, trim_model
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def evaluate_mode(rows, labels, baselines, runner, mode, path):
+    records = [
+        json.loads(line) for line in path.read_bytes().splitlines()
+    ] if path.exists() else []
+    if len(records) > len(rows):
+        raise ValueError("Ablation journal exceeds working coverage")
+    for row, record in zip(rows, records):
+        if (
+            record["example_id"] != row["id"]
+            or record["text_sha256"] != text_hash(row["text"])
+            or record["true_label"] != row["label"]
+            or record["mode"] != mode
+            or type(record["valid"]) is not bool
+            or len(record["prediction_sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in record["prediction_sha256"])
+            or record["valid"] != (record["predicted_label"] in labels)
+            or (not record["valid"] and record["predicted_label"] is not None)
+            or (
+                record["valid"]
+                and text_hash(record["predicted_label"]) != record["prediction_sha256"]
+            )
+        ):
+            raise ValueError("Ablation journal does not match frozen inputs")
+    for row in rows[len(records):]:
+        prediction = runner.predict(row["text"], mode)
+        valid = prediction in labels
+        record = {
+            "example_id": row["id"],
+            "text_sha256": text_hash(row["text"]),
+            "true_label": row["label"],
+            "mode": mode,
+            "valid": valid,
+            "predicted_label": prediction if valid else None,
+            "prediction_sha256": text_hash(prediction),
+        }
+        append_record(path, record)
+        records.append(record)
+        if len(records) % 100 == 0:
+            print(json.dumps({"event": "wanda_only", "phase": path.stem,
+                              "completed": len(records), "total": len(rows)}), flush=True)
+    return {
+        "mode": mode,
+        "total": len(rows),
+        "correct": sum(r["valid"] and r["predicted_label"] == r["true_label"] for r in records),
+        "invalid": sum(not r["valid"] for r in records),
+        "agreement": {
+            base_mode: sum(
+                r["prediction_sha256"] == text_hash(base[r["example_id"]]["predicted_label"])
+                for r in records
+            )
+            for base_mode, base in baselines.items()
+        },
+    }
+
+
+def run(root, device, resume):
+    cold_started = time.perf_counter()
+    registration = require_preregistration(root)
+    vocabulary_path = root / "runs/vocabulary.json"
+    config = {
+        "purpose": "non-selecting-wanda-only-ablation",
+        "registration": object_hash(registration),
+        "script_sha256": sha256_file(Path(__file__)),
+        "data_commitment": data_commitment(root),
+        "vocabulary_sha256": sha256_file(vocabulary_path),
+        "source_sha256": MODEL_SHA256,
+        "source_targets": [463114291, 152800000],
+        "group_size": 4,
+        "calibration_count": 256,
+        "optimizer_updates": 0,
+        "seed": SEED,
+        "device": device,
+    }
+    output = root / "runs/ablations" / f"wanda-only-{object_hash(config)[:16]}"
+    output.mkdir(parents=True, exist_ok=resume)
+    if resume:
+        if read_json(output / "config.json") != config:
+            raise ValueError("Ablation configuration changed")
+    else:
+        write_json(output / "config.json", config, exclusive=True)
+    report_path = output / "report.json"
+    if report_path.exists():
+        report = read_json(report_path)
+        if report["config_hash"] != object_hash(config) or any(
+            sha256_file(output / name) != digest for name, digest in report["files"].items()
+        ):
+            raise ValueError("Completed ablation evidence changed")
+        return report
+    weights = list((root / "assets/base").glob("*.safetensors"))
+    if len(weights) != 1 or sha256_file(weights[0]) != MODEL_SHA256:
+        raise ValueError("Ablation requires the pinned original source weights")
+    vocabulary = Vocabulary.load(vocabulary_path)
+    working = load_split(root, "banking/working", purpose="search")
+    labels = read_json(root / "data/manifest.json")["labels"]
+    baselines = {}
+    for mode in ("greedy", "constrained"):
+        path = root / "runs/baseline" / f"working-{len(working)}-{mode}.jsonl"
+        baselines[mode] = {
+            r["example_id"]: r for r in map(json.loads, path.read_bytes().splitlines())
+        }
+        if set(baselines[mode]) != {r["id"] for r in working}:
+            raise ValueError("Working baseline coverage differs")
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
+    model = load_base(root / "assets/base", device)
+    trim_model(model, vocabulary)
+    adapter = CompactTokenizer(load_tokenizer(root / "assets/base"), vocabulary)
+    modules = replace_linears(model, 4)
+    wanda_initialize(model, modules, adapter, load_split(root, "banking/train", purpose="search"))
+    original_hash = frozen_hash(model)
+    model.eval()
+    runner = Runner(model, adapter, labels)
+    metrics, files = [], {}
+    for target in config["source_targets"]:
+        budget = Budget(len(vocabulary.retained), 4, target,
+                        diagnostic_oversize=target > PARAMETER_CAP)
+        if sum(m.scores.numel() for m in modules.values()) != budget.total_groups:
+            raise ValueError("Maskable graph differs from registered budget")
+        set_global_mask(modules, budget.keep_groups)
+        entries = budget.dense_entries + sum(int(m.hard.sum()) * 4 for m in modules.values())
+        if entries != budget.source_entries:
+            raise ValueError("Wanda mask violates the exact budget")
+        for mode in ("greedy", "constrained"):
+            path = output / f"target-{target}-{mode}.jsonl"
+            result = evaluate_mode(working, labels, baselines, runner, mode, path)
+            result.update({"source_target": target, "entries": entries})
+            metrics.append(result)
+            files[path.name] = sha256_file(path)
+            print(json.dumps(result), flush=True)
+    if frozen_hash(model) != original_hash:
+        raise RuntimeError("Source values changed during non-selecting ablation")
+    report = {
+        "config_hash": object_hash(config), "purpose": config["purpose"],
+        "optimizer_updates": 0, "source_unchanged": True,
+        "source_frozen_hash": original_hash, "metrics": metrics, "files": files,
+        "resumed": resume, "process_elapsed_seconds": time.perf_counter() - cold_started,
+        "host_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated()
+        if device.startswith("cuda") else 0,
+        "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved()
+        if device.startswith("cuda") else 0,
+        "locked_exam_opened": False,
+    }
+    write_json(report_path, report, exclusive=True)
+    return report
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(run(args.root.resolve(), args.device, args.resume)), flush=True)

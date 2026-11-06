@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -87,26 +89,38 @@ class ExamSession:
             "manifest_sha256": self.attestation["manifest_sha256"],
             "commit": self.attestation["commit"],
         }
-        if resume:
-            previous = read_json(self.receipt)
-            if previous.get("status") != "started" or any(
-                previous.get(k) != v for k, v in identity.items()
-            ):
-                raise PermissionError("No matching unfinished session to resume")
-        else:
-            try:
-                write_json(self.receipt, {**identity, "status": "started"}, exclusive=True)
-            except FileExistsError as exc:
-                raise PermissionError("Exam already started; no second session is allowed") from exc
         self.identity = identity
-        # A separate exclusive active lock prevents two --resume processes.
+        # Keep this inode in place. Kernel ownership survives races and clears on process death.
         self.active = self.root / "runs" / "exam_active.lock"
+        self.active.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = self.active.open("a+b")
         try:
-            write_json(self.active, identity, exclusive=True)
-        except FileExistsError as exc:
-            raise PermissionError(
-                "An exam process is active or requires explicit crash recovery"
-            ) from exc
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._lock.close()
+            raise PermissionError("An exam process is active") from exc
+        try:
+            if resume:
+                previous = read_json(self.receipt)
+                if previous.get("status") != "started" or any(
+                    previous.get(k) != v for k, v in identity.items()
+                ):
+                    raise PermissionError("No matching unfinished session to resume")
+            else:
+                try:
+                    write_json(self.receipt, {**identity, "status": "started"}, exclusive=True)
+                except FileExistsError as exc:
+                    raise PermissionError(
+                        "Exam already started; no second session is allowed"
+                    ) from exc
+            self._lock.seek(0)
+            self._lock.truncate()
+            self._lock.write(canonical({**identity, "pid": os.getpid()}))
+            self._lock.flush()
+            os.fsync(self._lock.fileno())
+        except BaseException:
+            self.release_after_error()
+            raise
 
     def rows(self, name: str):
         if name not in {"banking/exam", "clinc/test"}:
@@ -139,7 +153,9 @@ class ExamSession:
                 "result_sha256": hashlib.sha256(canonical(result)).hexdigest(),
             },
         )
-        self.active.unlink()
+        self.release_after_error()
 
     def release_after_error(self) -> None:
-        self.active.unlink(missing_ok=True)
+        if not self._lock.closed:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()

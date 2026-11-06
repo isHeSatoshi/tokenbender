@@ -149,23 +149,56 @@ class Runner:
         return self.tokenizer.decode(generated)
 
     @torch.inference_mode()
-    def label_logprobs(self, text: str) -> torch.Tensor:
+    def label_logprobs(self, text: str, batch_size: int = 8) -> torch.Tensor:
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("Label batch size must be a positive integer")
         prompt = self.tokenizer.prompt(text)
         scores = []
-        # A single label at a time bounds peak logits memory independently of label count.
-        for label in self.labels:
-            continuation = self.tokenizer.label(text, label)
-            ids = torch.tensor([prompt + continuation[:-1]], device=self.device)
-            hidden = self.model.model(ids, use_cache=False, return_dict=True).last_hidden_state
-            logits = self.model.lm_head(hidden[:, len(prompt) - 1 :]).float()
-            targets = torch.tensor(continuation, device=self.device)
-            scores.append(logits[0].log_softmax(-1).gather(1, targets[:, None]).sum())
+        paths = [self.tokenizer.label(text, label) for label in self.labels]
+        for start in range(0, len(paths), batch_size):
+            batch = paths[start : start + batch_size]
+            sequences = [prompt + continuation[:-1] for continuation in batch]
+            width = max(map(len, sequences))
+            ids = torch.full(
+                (len(batch), width),
+                self.tokenizer.eos_token_id,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            attention = torch.zeros_like(ids)
+            for index, sequence in enumerate(sequences):
+                ids[index, : len(sequence)] = torch.tensor(sequence, device=self.device)
+                attention[index, : len(sequence)] = 1
+            hidden = self.model.model(
+                ids, attention_mask=attention, use_cache=False, return_dict=True
+            ).last_hidden_state
+            positions = torch.cat(
+                [
+                    hidden[index, len(prompt) - 1 : len(prompt) + len(continuation) - 1]
+                    for index, continuation in enumerate(batch)
+                ]
+            )
+            logits = self.model.lm_head(positions).float()
+            targets = torch.tensor([token for path in batch for token in path], device=self.device)
+            token_scores = logits.log_softmax(-1).gather(1, targets[:, None])[:, 0]
+            offset = 0
+            for continuation in batch:
+                scores.append(token_scores[offset : offset + len(continuation)].sum())
+                offset += len(continuation)
         return torch.stack(scores).cpu()
 
     @torch.inference_mode()
-    def feature(self, text: str, layer: int) -> np.ndarray:
+    def features(self, text: str, layers) -> dict[int, np.ndarray]:
         ids = torch.tensor([self.tokenizer.prompt(text)], device=self.device)
         output = self.model.model(ids, use_cache=False, output_hidden_states=True, return_dict=True)
-        if not 0 <= layer < len(output.hidden_states):
+        if any(
+            type(layer) is not int or not 0 <= layer < len(output.hidden_states) for layer in layers
+        ):
             raise ValueError("Feature layer is outside this model")
-        return output.hidden_states[layer][0, -1].float().cpu().numpy()
+        return {
+            layer: output.hidden_states[layer][0, -1].float().cpu().numpy().copy()
+            for layer in layers
+        }
+
+    def feature(self, text: str, layer: int) -> np.ndarray:
+        return self.features(text, [layer])[layer]

@@ -52,16 +52,30 @@ and pushing need the user's explicit authorization for the named repository.
 After that commitment:
 
 ```bash
+uv run tenpercent search-mask --steps 200 --resource-pilot
 uv run tenpercent search-mask --steps 200 --learning-rate 0.003
 uv run tenpercent pack --candidate CANDIDATE_ID
 uv run tenpercent verify --bundle /absolute/path/to/runs/bundles/A
 ```
 
-`replay-feedback` is experimental. `freeze` and `final-evaluate` currently refuse
-to run, before reading any sealed rows or creating an exam receipt. They will be
-released only after automatic calibration and source-isolated evaluation workers
-are implemented and tested. The single-session/hash guard itself has synthetic
-tests. `report` only reads already-saved results.
+The non-selecting resource pilot scans the complete teacher cache, repeats its
+longest input for full accumulated Adam updates at three densities, and measures
+cold-load RSS and CUDA allocation/reservation. It does not produce an eligible A.
+
+After freezing A, `prepare-feedback` writes a text-free public stream and commitment.
+Publish and attest it before `calibrate-feedback`, then `replay-feedback` using
+the selected config and calibration report. Replay starts with fresh memory;
+`--resume` continues the same journal after an interruption.
+
+`standalone-validate` compares all four packages with their selected-state
+references on working/validation and synthetic inputs, verifies every retained
+source word, and runs the synthetic final pipeline. Linux bubblewrap is required.
+Candidate workers have read-only packages, no source/data/key mounts, and no
+external network interface. Baselines use separate source-only workers.
+
+`freeze` and `final-evaluate` reject missing, failed, or stale real-model proofs
+before creating an exam receipt. No qualifying A/B or real standalone proof exists
+yet. `report` only reads saved results.
 
 ## Measured local development evidence
 
@@ -72,7 +86,10 @@ The retained vocabulary has **9,999 rows**; all 151,643 ordinary source-token
 expansions were checked. Original-vocabulary all-one masks pass bit-equal logits
 and identical greedy predictions on **all 770 working examples**.
 
-An eight-example real teacher-cache smoke and a tiny Qwen search pass.
+The full teacher cache contains **50,003 examples**, including **40,000**
+training-only variants. The full base changed 4,234 variant pseudo-labels.
+`teacher_commitment.json` commits the completed cache without publishing it.
+An eight-example smoke and a tiny Qwen search also pass.
 The tiny search exercises score gradients, both decoding modes, candidate masks,
 and optimizer/data-order resume. It is not a resource benchmark of the real search.
 
@@ -87,10 +104,11 @@ and optimizer/data-order resume. It is not a resource benchmark of the real sear
   Numeric memory entries count toward the 154,371,430-entry cap.
 * Full mask searches and the real feedback demo are **not yet validated**.
   Current feedback replay accepts an A without a training-memory booster.
-  Automatic memory-grid calibration, interrupted feedback replay, and isolated
-  final workers remain implementation work. Optimizer/data-order resume is
-  tested on a tiny model, not yet a full-size run. Do not interpret CLI
-  availability as gate completion.
+  The 288-setting memory grid, interrupted replay, atomic prediction recovery,
+  and all four isolated workers pass synthetic CPU tests. Optimizer/data-order
+  and random-state resume are tested on a tiny model, not yet a full-size run.
+  Real-model resource measurements and accuracy gates remain separate work.
+  Do not interpret CLI availability as gate completion.
 * The optional 308,746,714-byte container target is measured independently.
   Sparse storage does not promise lower latency or lower dense runtime memory.
 

@@ -92,6 +92,8 @@ def save_checkpoint(
         "best_rank": best_rank,
         "scores": {n: m.scores.detach().cpu() for n, m in modules.items()},
         "optimizer": optimizer.state_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else [],
     }
     torch.save(payload, temporary)
     os.replace(temporary, path)
@@ -107,6 +109,9 @@ def restore_checkpoint(path: Path, modules, optimizer, *, config_hash: str, devi
                 raise ValueError("Resume score shape mismatch")
             module.scores.copy_(payload["scores"][name])
     optimizer.load_state_dict(payload["optimizer"])
+    torch.set_rng_state(payload["torch_rng"].cpu())
+    if payload["cuda_rng"]:
+        torch.cuda.set_rng_state_all([state.cpu() for state in payload["cuda_rng"]])
     rng = np.random.default_rng()
     rng.bit_generator.state = json.loads(payload["rng_json"])
     return (
@@ -143,6 +148,33 @@ def wanda_initialize(model, modules, adapter, rows, calibration_count=256):
         module.initialize(accumulator[name].sqrt())
 
 
+def require_resource_pilot(root: Path, config: dict, device: str):
+    for path in sorted((root / "runs/pilots").glob("*/resource_report.json")):
+        report = read_json(path)
+        pilot = read_json(path.parent / "config.json")
+        if (
+            report["headroom_pass"]
+            and report["source_unchanged"]
+            and report["optimizer_updates"] == 3
+            and report["device"] == device
+            and report["teacher_examples_scanned"] == config["teacher_examples"]
+            and report["keep_group_phases"][0] == config["budget"]["total_groups"]
+            and report["keep_group_phases"][-1] <= config["budget"]["keep_groups"]
+            and all(
+                pilot[key] == config[key]
+                for key in (
+                    "registration",
+                    "teacher",
+                    "source_frozen_hash",
+                    "group_size",
+                    "accumulation",
+                )
+            )
+        ):
+            return
+    raise PermissionError("A matching fresh worst-input resource pilot must pass before search")
+
+
 def run_search(
     root: Path,
     *,
@@ -154,7 +186,11 @@ def run_search(
     device="cuda",
     diagnostic_oversize=False,
     resume=False,
+    resource_pilot=False,
 ):
+    cold_started = time.perf_counter()
+    if resource_pilot and resume:
+        raise ValueError("A resource pilot must start in a fresh process, not resume")
     registration = require_preregistration(root)
     validate_search_config(
         registration,
@@ -188,6 +224,8 @@ def run_search(
     ] != sha256_file(root / "runs/teacher.sqlite"):
         raise ValueError("Teacher cache differs from the public commitment")
     labels = read_json(root / "data" / "manifest.json")["labels"]
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
     model = load_base(root / "assets" / "base", device)
     trim_model(model, vocabulary)
     adapter = CompactTokenizer(load_tokenizer(root / "assets" / "base"), vocabulary)
@@ -201,16 +239,22 @@ def run_search(
     wanda_initialize(model, modules, adapter, train_rows)
     original_hash = frozen_hash(model)
     config = {
+        "registration": object_hash(registration),
         "steps": steps,
         "learning_rate": learning_rate,
         "accumulation": accumulation,
         "group_size": group_size,
         "budget": budget.report(),
         "teacher": object_hash(cache.metadata),
+        "teacher_examples": cache.metadata["examples"],
         "source_frozen_hash": original_hash,
     }
+    if resource_pilot:
+        config["purpose"] = "non-selecting-resource-pilot"
+    else:
+        require_resource_pilot(root, config, device)
     candidate_id = object_hash(config)[:16]
-    output = root / "runs" / "search" / candidate_id
+    output = root / "runs" / ("pilots" if resource_pilot else "search") / candidate_id
     output.mkdir(parents=True, exist_ok=resume)
     if resume:
         if read_json(output / "config.json") != config:
@@ -227,6 +271,13 @@ def run_search(
     ids = cache.ids()
     rng = np.random.default_rng(SEED)
     order = rng.permutation(len(ids))
+    max_tokens = None
+    if resource_pilot:
+        longest_index, max_tokens = max(
+            ((i, len(cache.get(key)["input_ids"])) for i, key in enumerate(ids)),
+            key=lambda item: (item[1], -item[0]),
+        )
+        order = np.full(accumulation, longest_index, dtype=np.int64)
     cursor = 0
     runner = Runner(model, adapter, labels)
     working = load_split(root, "banking/working", purpose="search")
@@ -255,10 +306,18 @@ def run_search(
             config_hash=object_hash(config),
             device=device,
         )
-    torch.cuda.reset_peak_memory_stats() if device.startswith("cuda") else None
     start = time.perf_counter()
-    for step in range(start_step, steps):
-        count = cubic_group_count(step, steps, budget.total_groups, budget.keep_groups)
+    phases = (
+        budget.total_groups,
+        (budget.total_groups + budget.keep_groups) // 2,
+        budget.keep_groups,
+    )
+    for step in range(start_step, 3 if resource_pilot else steps):
+        count = (
+            phases[step]
+            if resource_pilot
+            else cubic_group_count(step, steps, budget.total_groups, budget.keep_groups)
+        )
         set_global_mask(modules, count)
         optimizer.zero_grad(set_to_none=True)
         progress = (step + 1) / steps
@@ -269,7 +328,8 @@ def run_search(
         total_loss = 0
         for _ in range(accumulation):
             if cursor == len(order):
-                order = rng.permutation(len(ids))
+                if not resource_pilot:
+                    order = rng.permutation(len(ids))
                 cursor = 0
             record = {k: v.to(device) for k, v in cache.get(ids[int(order[cursor])]).items()}
             cursor += 1
@@ -290,6 +350,8 @@ def run_search(
             total_loss += float(loss.detach()) / accumulation
         grad = torch.nn.utils.clip_grad_norm_(parameters, 1.0, error_if_nonfinite=True)
         optimizer.step()
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
         append_record(
             output / "progress.jsonl",
             {
@@ -304,7 +366,7 @@ def run_search(
                 else 0,
             },
         )
-        if (step + 1) % 10 == 0:
+        if resource_pilot or (step + 1) % 10 == 0:
             print(
                 json.dumps(
                     {
@@ -317,7 +379,7 @@ def run_search(
                 ),
                 flush=True,
             )
-        if (step + 1) % 100 == 0 or step + 1 == steps:
+        if not resource_pilot and ((step + 1) % 100 == 0 or step + 1 == steps):
             model.eval()
             set_global_mask(
                 modules,
@@ -374,6 +436,32 @@ def run_search(
     if frozen_hash(model) != original_hash:
         raise RuntimeError("Source model values changed during score optimization")
     cache.close()
+    if resource_pilot:
+        reserved = torch.cuda.max_memory_reserved() if device.startswith("cuda") else 0
+        total = (
+            torch.cuda.get_device_properties(device).total_memory
+            if device.startswith("cuda")
+            else 0
+        )
+        report = {
+            "format": 1,
+            "purpose": "resource-pilot-only",
+            "device": device,
+            "optimizer_updates": 3,
+            "accumulation": accumulation,
+            "teacher_examples_scanned": len(ids),
+            "max_input_tokens": max_tokens,
+            "keep_group_phases": list(phases),
+            "source_unchanged": True,
+            "cold_elapsed_seconds": time.perf_counter() - cold_started,
+            "host_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+            "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated() if total else 0,
+            "cuda_peak_reserved_bytes": reserved,
+            "cuda_total_bytes": total,
+            "headroom_pass": not total or reserved * 10 <= total * 9,
+        }
+        write_json(output / "resource_report.json", report)
+        return {"resource_pilot": candidate_id, "report": report}
     append_record(
         root / "runs" / "candidates.jsonl",
         {

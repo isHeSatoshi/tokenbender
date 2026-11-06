@@ -303,6 +303,9 @@ def load_bundle(path: Path, device="cuda"):
     )
     labels = read_json(path / "labels.json")
     runner = Runner(model, adapter, labels)
+    from .constants import NEW_INTENTS
+
+    runner.output_labels = labels + [label for label in NEW_INTENTS if label not in labels]
     if (path / "memory.json").exists():
         memory = FeedbackMemory.load(path / "memory.json")
         if memory.numeric_entries != manifest["auxiliary_entries"]:

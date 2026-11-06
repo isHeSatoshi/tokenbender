@@ -1,0 +1,1 @@
+{"cuda_peak_allocated_bytes":9581568,"denied_source_checks":1,"full_size_resource_pilot":"not yet run","gpu_sandbox_pass":true,"locked_exam_opened":false,"network_interfaces":["lo"],"pytest_passed":80,"real_A_B":"not yet produced","scope":"tiny-model synthetic tests, not full-size optimization"}

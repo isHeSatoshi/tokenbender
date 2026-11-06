@@ -34,3 +34,11 @@ def test_missing_ids_and_changed_truth_are_errors():
     b[1]["true_label"] = "different"
     with pytest.raises(ValueError):
         aligned_correctness(a, b)
+
+
+def test_invalid_prediction_is_wrong_even_when_string_matches_truth():
+    values = records([True])
+    values[0]["valid"] = False
+    assert summarize(values, ["a"])["correct"] == 0
+    assert summarize(values, ["a"])["invalid"] == 1
+    assert not aligned_correctness(values)[0][0]

@@ -7,12 +7,16 @@ import numpy as np
 from .constants import PARAMETER_CAP, SEED
 
 
+def is_correct(record: dict) -> bool:
+    return bool(record.get("valid", True)) and record["predicted_label"] == record["true_label"]
+
+
 def summarize(records: list[dict], labels: list[str]) -> dict:
     if not records or len({r["example_id"] for r in records}) != len(records):
         raise ValueError("Predictions must be nonempty with unique IDs")
     by_label = defaultdict(lambda: [0, 0])
     for row in records:
-        correct = int(row["predicted_label"] == row["true_label"])
+        correct = int(is_correct(row) and row["predicted_label"] in labels)
         by_label[row["true_label"]][0] += correct
         by_label[row["true_label"]][1] += 1
     correct = sum(pair[0] for pair in by_label.values())
@@ -24,7 +28,9 @@ def summarize(records: list[dict], labels: list[str]) -> dict:
         "correct": correct,
         "total": len(records),
         "accuracy": correct / len(records),
-        "invalid": sum(row["predicted_label"] not in labels for row in records),
+        "invalid": sum(
+            not row.get("valid", True) or row["predicted_label"] not in labels for row in records
+        ),
         "macro_accuracy": float(np.mean([v["accuracy"] for v in per_label.values()])),
         "per_label": per_label,
     }
@@ -40,9 +46,7 @@ def aligned_correctness(*groups: list[dict]) -> list[np.ndarray]:
     for key in ids:
         if len({m[key]["true_label"] for m in maps}) != 1:
             raise ValueError("Ground truth differs between prediction records")
-    return [
-        np.asarray([m[key]["predicted_label"] == m[key]["true_label"] for key in ids]) for m in maps
-    ]
+    return [np.asarray([is_correct(m[key]) for key in ids]) for m in maps]
 
 
 def paired_comparison(candidate, base_greedy, base_constrained, *, draws=10_000, seed=SEED):

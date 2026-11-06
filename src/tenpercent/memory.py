@@ -131,9 +131,11 @@ class FeedbackMemory:
         self.fingerprints.append(fingerprint)
         return "added"
 
-    def distribution(self, hidden: np.ndarray) -> np.ndarray | None:
+    def nearest(self, hidden: np.ndarray, count: int | None = None):
         if not self.keys:
-            return None
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        if count is not None and (type(count) is not int or count < 1):
+            raise ValueError("Invalid neighbor count")
         query = self.projected(hidden)
         keys = (
             np.stack(self.keys).astype(np.float32)
@@ -143,14 +145,19 @@ class FeedbackMemory:
         keys = np.divide(keys, norms, out=np.zeros_like(keys), where=norms != 0)
         distances = np.clip(1 - keys @ query, 0, 2)
         order = np.argsort(distances, kind="stable")
-        admitted = [i for i in order if distances[i] <= self.config.radius]
-        if not admitted:
+        if count is not None:
+            order = order[:count]
+        return order, distances[order]
+
+    def distribution(self, hidden: np.ndarray) -> np.ndarray | None:
+        order, distances = self.nearest(hidden, self.config.neighbors)
+        admitted = distances <= self.config.radius
+        if not admitted.any():
             return None
-        admitted = admitted[: self.config.neighbors]
-        d = distances[admitted]
+        order, d = order[admitted], distances[admitted]
         weights = np.exp(-(d - d.min()) / self.config.temperature)
         probabilities = np.zeros(len(self.labels), dtype=np.float64)
-        for index, weight in zip(admitted, weights, strict=True):
+        for index, weight in zip(order, weights, strict=True):
             probabilities[self.label_ids[index]] += weight
         return probabilities / probabilities.sum()
 
@@ -175,9 +182,9 @@ class FeedbackMemory:
     def clone(self):
         return copy.deepcopy(self)
 
-    def save(self, path: Path):
+    def payload(self):
         # IDs/hashes support replay only; no exemplar text is stored.
-        payload = {
+        return {
             "format": 1,
             "labels": self.labels,
             "config": asdict(self.config),
@@ -189,11 +196,16 @@ class FeedbackMemory:
             "fingerprints": self.fingerprints,
             "quarantined": self.quarantined,
         }
-        atomic_bytes(path, canonical(payload))
+
+    def save(self, path: Path):
+        atomic_bytes(path, canonical(self.payload()))
 
     @classmethod
     def load(cls, path: Path):
-        value = read_json(path)
+        return cls.from_payload(read_json(path))
+
+    @classmethod
+    def from_payload(cls, value: dict):
         if value["format"] != 1:
             raise ValueError("Unsupported feedback memory")
         memory = cls(value["labels"], MemoryConfig(**value["config"]))
@@ -241,6 +253,7 @@ class MemoryRunner:
     def __init__(self, base_runner, memory: FeedbackMemory, mode: str = "constrained"):
         self.base_runner, self.memory, self.mode = base_runner, memory, mode
         self.labels = memory.labels
+        self.device = getattr(base_runner, "device", "cpu")
         if self.labels[: len(base_runner.labels)] != base_runner.labels:
             raise ValueError("Memory labels must extend original label IDs")
 
@@ -249,6 +262,8 @@ class MemoryRunner:
         vote = self.memory.distribution(hidden)
         if vote is None:
             return self.base_runner.predict(text, mode=self.mode)
+        if self.memory.config.blend == 1:
+            return self.labels[int(vote.argmax())]
         scores = self.base_runner.label_logprobs(text).numpy()
         probabilities = np.exp(scores - scores.max())
         probabilities /= probabilities.sum()

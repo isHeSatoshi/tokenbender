@@ -49,6 +49,11 @@ def parser() -> argparse.ArgumentParser:
         help="Permit a 30%% diagnostic budget, never a qualifying bundle",
     )
     search.add_argument("--resume", action="store_true")
+    search.add_argument(
+        "--resource-pilot",
+        action="store_true",
+        help="Fresh non-selecting cold-load/three-density/worst-input optimizer measurement",
+    )
     pack = commands.add_parser("pack", help="Pack an eligible selected candidate as immutable A")
     pack.add_argument("--candidate", required=True)
     pack.add_argument("--device", default="cuda")
@@ -59,7 +64,23 @@ def parser() -> argparse.ArgumentParser:
     )
     feedback.add_argument("--state-a", type=Path, required=True)
     feedback.add_argument("--config", type=Path, required=True)
+    feedback.add_argument("--calibration", type=Path, required=True)
+    feedback.add_argument("--resume", action="store_true")
     feedback.add_argument("--device", default="cuda")
+    prepare_feedback = commands.add_parser(
+        "prepare-feedback", help="Commit frozen-A review and a text-free public stream"
+    )
+    prepare_feedback.add_argument("--state-a", type=Path, required=True)
+    prepare_feedback.add_argument("--device", default="cuda")
+    calibrate = commands.add_parser(
+        "calibrate-feedback", help="Search the public finite memory grid without test access"
+    )
+    calibrate.add_argument("--state-a", type=Path, required=True)
+    calibrate.add_argument("--device", default="cuda")
+    standalone = commands.add_parser(
+        "standalone-validate", help="Verify four frozen packages in source-free network namespaces"
+    )
+    standalone.add_argument("--device", default="cuda")
     commands.add_parser("preregister", help="Generate measured local preregistration inputs")
     commands.add_parser("freeze", help="Write the final manifest, before commit/push/attestation")
     final = commands.add_parser("final-evaluate", help="Single guarded frozen exam session")
@@ -128,6 +149,7 @@ def dispatch(args):
                 device=args.device,
                 diagnostic_oversize=args.diagnostic_oversize,
                 resume=args.resume,
+                resource_pilot=args.resource_pilot,
             )
         case "pack":
             from .workflow import pack_candidate
@@ -137,12 +159,42 @@ def dispatch(args):
             from .bundle import verify_lineage
 
             return verify_lineage(args.bundle.resolve(), root / "assets/base/model.safetensors")
+        case "prepare-feedback":
+            from .calibration import prepare_feedback
+
+            return prepare_feedback(root, args.state_a.resolve(), device=args.device)
+        case "calibrate-feedback":
+            from .calibration import calibrate_feedback
+
+            return calibrate_feedback(root, args.state_a.resolve(), device=args.device)
         case "replay-feedback":
             from .workflow import replay_feedback
 
             return replay_feedback(
-                root, args.state_a.resolve(), args.config.resolve(), device=args.device
+                root,
+                args.state_a.resolve(),
+                args.config.resolve(),
+                args.calibration.resolve(),
+                device=args.device,
+                resume=args.resume,
             )
+        case "standalone-validate":
+            from .validation import standalone_validate
+
+            proof = standalone_validate(root, device=args.device)
+            return {
+                "proof": "runs/standalone_validation.json",
+                "passed": proof["passed"],
+                "synthetic_final": proof["synthetic_final"],
+                "states": {
+                    name: {
+                        "entries": proof["states"][name]["retained_entries"],
+                        "bytes": report["archive"]["bytes"],
+                        "mismatches": report["mismatches"],
+                    }
+                    for name, report in proof["reports"].items()
+                },
+            }
         case "preregister":
             from .workflow import create_preregistration
 

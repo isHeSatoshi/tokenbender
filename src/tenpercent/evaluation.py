@@ -7,47 +7,84 @@ from pathlib import Path
 
 import torch
 
-from .io import append_record, object_hash, read_json, write_json
+from .io import append_record, atomic_bytes, canonical, object_hash, read_json, write_json
 from .metrics import summarize
 
 
 def evaluate(runner, rows: list[dict], output: Path, *, mode: str, state_hash: str):
+    output_labels = getattr(runner, "output_labels", runner.labels)
+    cuda = torch.cuda.is_available() and str(getattr(runner, "device", "cpu")).startswith("cuda")
     expected = {r["id"]: r for r in rows}
+    if len(expected) != len(rows):
+        raise ValueError("Evaluation input IDs must be unique")
     records = []
+    pending_path = output.with_suffix(".pending.json")
+    partial = b""
     if output.exists():
-        records = [json.loads(line) for line in output.read_bytes().splitlines()]
-        for record in records:
-            if (
-                record["example_id"] not in expected
-                or record["mode"] != mode
-                or record["state_hash"] != state_hash
-                or record["true_label"] != expected[record["example_id"]]["label"]
-            ):
-                raise ValueError("Existing predictions do not match this frozen evaluation")
+        lines = output.read_bytes().splitlines(keepends=True)
+        if lines and not lines[-1].endswith(b"\n"):
+            partial = lines.pop()
+        records = [json.loads(line) for line in lines]
         if len({r["example_id"] for r in records}) != len(records):
             raise ValueError("Duplicate prediction journal records")
+
+    def validate(record):
+        if (
+            record["example_id"] not in expected
+            or record["mode"] != mode
+            or record["state_hash"] != state_hash
+            or record["true_label"] != expected[record["example_id"]]["label"]
+            or record["valid"] != (record["predicted_label"] in output_labels)
+        ):
+            raise ValueError("Existing predictions do not match this frozen evaluation")
+
+    for record in records:
+        validate(record)
+    if pending_path.exists():
+        pending = read_json(pending_path)
+        validate(pending)
+        previous = next((r for r in records if r["example_id"] == pending["example_id"]), None)
+        if previous is not None:
+            if previous != pending or partial:
+                raise ValueError("Pending prediction disagrees with the committed journal")
+        else:
+            if partial:
+                if not canonical(pending).startswith(partial):
+                    raise ValueError(
+                        "Truncated prediction journal does not match its pending record"
+                    )
+                atomic_bytes(output, b"".join(canonical(r) for r in records) + canonical(pending))
+            else:
+                append_record(output, pending)
+            records.append(pending)
+        pending_path.unlink()
+    elif partial:
+        raise ValueError("Truncated prediction journal has no durable pending record")
     seen = {r["example_id"] for r in records}
-    if torch.cuda.is_available():
+    if cuda:
         torch.cuda.reset_peak_memory_stats()
     for row in rows:
         if row["id"] in seen:
             continue
-        if torch.cuda.is_available():
+        if cuda:
             torch.cuda.synchronize()
         start = time.perf_counter()
         prediction = runner.predict(row["text"], mode=mode)
-        if torch.cuda.is_available():
+        if cuda:
             torch.cuda.synchronize()
         record = {
             "example_id": row["id"],
             "true_label": row["label"],
             "predicted_label": prediction,
-            "valid": prediction in runner.labels,
+            "valid": prediction in output_labels,
             "mode": mode,
             "state_hash": state_hash,
             "seconds": time.perf_counter() - start,
         }
+        # Persist the result before appending, so a torn append never reruns this query.
+        write_json(pending_path, record)
         append_record(output, record)
+        pending_path.unlink()
         records.append(record)
         if len(records) % 25 == 0:
             # No text or labels are exposed in progress output.
@@ -57,9 +94,9 @@ def evaluate(runner, rows: list[dict], output: Path, *, mode: str, state_hash: s
                 ),
                 flush=True,
             )
-    report = summarize(records, runner.labels)
+    report = summarize(records, output_labels)
     report["host_peak_rss_bytes"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-    if torch.cuda.is_available():
+    if cuda:
         report["cuda_peak_allocated"] = torch.cuda.max_memory_allocated()
         report["cuda_peak_reserved"] = torch.cuda.max_memory_reserved()
     report["state_hash"] = state_hash

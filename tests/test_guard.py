@@ -1,6 +1,8 @@
 import hashlib
 import io
 import json
+import subprocess
+import sys
 from urllib.error import URLError
 
 import pytest
@@ -120,3 +122,25 @@ def test_modified_manifest_and_encrypted_exam_refused(tmp_path, monkeypatch):
     (tmp_path / "final_manifest.json").write_bytes(canonical({"format": 1}))
     with pytest.raises(PermissionError, match="manifest"):
         guard.ExamSession(tmp_path, tmp_path / "attestation.json")
+
+
+def test_kernel_releases_crashed_exam_owner_but_receipt_still_prevents_second_start(
+    tmp_path, monkeypatch
+):
+    fixture(tmp_path)
+    program = (
+        "import os, sys; from pathlib import Path; import tenpercent.guard as g; "
+        "g.verify_public_commit=lambda *args: None; "
+        "root=Path(sys.argv[1]); session=g.ExamSession(root, root/'attestation.json'); "
+        "os._exit(19)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path)], capture_output=True, timeout=15
+    )
+    assert completed.returncode == 19
+    monkeypatch.setattr(guard, "verify_public_commit", lambda *args: None)
+    with pytest.raises(PermissionError, match="second session"):
+        guard.ExamSession(tmp_path, tmp_path / "attestation.json")
+    resumed = guard.ExamSession(tmp_path, tmp_path / "attestation.json", resume=True)
+    assert resumed.rows("banking/exam")[0]["id"] == "exam:1"
+    resumed.finish({"synthetic": True})

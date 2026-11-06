@@ -119,6 +119,17 @@ def test_tiny_search_updates_scores_selects_both_modes_and_resumes(tmp_path, mon
                 },
             )
     before = training.frozen_hash(model)
+    with pytest.raises(PermissionError, match="resource pilot"):
+        training.run_search(tmp_path, steps=2, accumulation=1, source_target=target, device="cpu")
+    pilot = training.run_search(
+        tmp_path, steps=2, accumulation=1, source_target=target, device="cpu", resource_pilot=True
+    )
+    assert pilot["report"]["optimizer_updates"] == 3
+    assert pilot["report"]["max_input_tokens"] == 3
+    assert pilot["report"]["source_unchanged"]
+    assert pilot["report"]["keep_group_phases"][0] > pilot["report"]["keep_group_phases"][-1]
+    assert not (tmp_path / "runs/candidates.jsonl").exists()
+    assert not (tmp_path / "runs/pilots" / pilot["resource_pilot"] / "selection.json").exists()
     result = training.run_search(
         tmp_path, steps=2, accumulation=1, source_target=target, device="cpu"
     )
@@ -197,6 +208,7 @@ def test_optimizer_scores_and_data_order_resume_exactly(tmp_path):
         best_rank=(9, 8, -40),
     )
     expected_next = rng.permutation(7)
+    expected_torch = torch.rand(7)
     with torch.no_grad():
         modules["x"].scores.add_(1)
     step, restored_order, cursor, restored_rng, rank = restore_checkpoint(
@@ -212,6 +224,7 @@ def test_optimizer_scores_and_data_order_resume_exactly(tmp_path):
     assert torch.equal(modules["x"].scores, saved_scores)
     assert torch.equal(modules["x"].weight, saved_weights)
     assert len(optimizer.state[modules["x"].scores]) == 3
+    assert torch.equal(torch.rand(7), expected_torch)
     with pytest.raises(ValueError, match="candidate"):
         restore_checkpoint(
             tmp_path / "resume.pt", modules, optimizer, config_hash="changed", device="cpu"

@@ -3,13 +3,13 @@
 Execution owner and approved public repository: `isHeSatoshi/tokenbender`.
 
 This is a working implementation under development, not a completed challenge
-submission. The full train-only teacher-cache job is running locally. The
-complete teacher commitment and preregistration will be published before any
-real mask search. No locked exam has been opened.
+submission. The full 50,003-example train-only teacher cache is complete.
+Its commitment and the pre-search registration accompany this implementation.
+No real mask search or locked evaluation preceded this registration.
 
 Measured so far:
 
-* 55 automated tests pass, and Ruff checks pass.
+* 80 automated tests pass, and Ruff checks pass.
 * Both original base decoding modes score 719/770 on working data.
 * Vocabulary-only decoding also scores 719/770 in each mode and agrees with
   the corresponding original base on all 770 predictions.
@@ -21,14 +21,17 @@ Measured so far:
   deterministic variants. The maximum teacher-input bound is 130 tokens.
 * A real eight-example teacher-cache smoke and tiny score-only optimizer,
   selection, packaging, and resume tests pass.
+* All four packaged states pass a real CPU source-isolated/network-disabled
+  synthetic final dry run. Pending prediction recovery avoids repeated queries.
+  A tiny CUDA sandbox smoke is validated separately from full-size optimization.
 
 Full-size score optimization has not run. Its resource fit and accuracy are
-unmeasured. Automatic memory calibration, crash-safe feedback replay, and
-source-isolated final workers remain unfinished. The final exam CLI refuses
-to run until those safeguards are implemented.
+unmeasured. The 288-setting memory grid, crash-safe feedback replay, and isolated
+workers pass synthetic tests, but no real A/B exists. The final exam CLI refuses
+missing, failed, or stale real-model G3/standalone proofs.
 
 JSON files here contain aggregate results, versions, hashes, and structural
 metadata only. The `pending` list in `local_validation.json` records the
-pre-publication validation state; this status file records the publication
-authorization received afterward. No model payload, source utterance, sealed
+initial publication state; this status file records subsequent implementation
+validation. No model payload, source utterance, sealed
 exam, or decryption key is included.
